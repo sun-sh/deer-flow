@@ -23,6 +23,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from langchain_core.outputs import ChatGeneration, ChatResult
 
 from deerflow.models.credential_loader import CodexCliCredential, load_codex_cli_credential
+from deerflow.utils.retry_after import bounded_retry_after_ms
 
 logger = logging.getLogger(__name__)
 
@@ -259,6 +260,37 @@ class CodexChatModel(BaseChatModel):
             responses_tools.append(converted)
         return responses_tools
 
+    @staticmethod
+    def _calc_backoff_ms(attempt: int, error: Exception) -> int:
+        """Exponential backoff, overridden by a usable provider ``Retry-After``.
+
+        Mirrors ``ClaudeChatModel._calc_backoff_ms``: a server-supplied delay is
+        honored verbatim (bounded by ``MAX_RETRY_AFTER_MS``) so a burst throttle
+        answered with a hint is not retried early against the same window.
+        ``config/app_config.py`` states the contract — "Ignored when the provider
+        sends Retry-After (honored verbatim)" — and only an unusable hint (a
+        non-finite value, one past the 24h bound, or unparseable text) falls back
+        to the local exponential schedule.
+
+        Both the millisecond form (``retry-after-ms``, what the OpenAI clients
+        emit) and the seconds-based HTTP form are accepted, matching
+        ``llm_error_handling_middleware._extract_retry_after_ms``.
+        """
+        response = getattr(error, "response", None)
+        headers = getattr(response, "headers", None)
+        if headers is not None:
+            for key, multiplier in (("retry-after-ms", 1.0), ("retry-after", 1000.0)):
+                raw = headers.get(key)
+                if raw is None:
+                    continue
+                try:
+                    hint_ms = bounded_retry_after_ms(float(raw) * multiplier)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if hint_ms is not None:
+                    return hint_ms
+        return 2000 * (1 << (attempt - 1))
+
     def _call_codex_api(self, messages: list[BaseMessage], tools: list[dict] | None = None, tool_choice: str | dict | bool | None = None) -> dict:
         """Call the Codex Responses API and return the completed response."""
         instructions, input_items = self._convert_messages(messages)
@@ -288,24 +320,21 @@ class CodexChatModel(BaseChatModel):
             "originator": "codex_cli_rs",
         }
 
-        last_error = None
+        last_error: Exception | None = None
         for attempt in range(1, self.retry_max_attempts + 1):
             try:
                 return self._stream_response(headers, payload)
             except httpx.HTTPStatusError as e:
                 last_error = e
-                if e.response.status_code in (429, 500, 529):
-                    if attempt >= self.retry_max_attempts:
-                        raise
-                    wait_ms = 2000 * (1 << (attempt - 1))
-                    logger.warning(f"Codex API error {e.response.status_code}, retrying {attempt}/{self.retry_max_attempts} after {wait_ms}ms")
-                    time.sleep(wait_ms / 1000)
-                else:
+                if e.response.status_code not in (429, 500, 529):
                     raise
-            except Exception:
-                raise
+                if attempt >= self.retry_max_attempts:
+                    raise
+                wait_ms = self._calc_backoff_ms(attempt, e)
+                logger.warning(f"Codex API error {e.response.status_code}, retrying {attempt}/{self.retry_max_attempts} after {wait_ms}ms")
+                time.sleep(wait_ms / 1000)
 
-        raise last_error
+        raise last_error  # unreachable: retry_max_attempts >= 1 is validated in model_post_init
 
     def _stream_response(self, headers: dict, payload: dict) -> dict:
         """Stream SSE from Codex API and collect the final response."""
