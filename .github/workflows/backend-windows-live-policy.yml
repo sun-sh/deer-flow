@@ -4,6 +4,8 @@ name: Windows Live Test Policy
 # and the workspace text-cache tests pin byte-exact cache round-trips whose
 # regression only fails on native Windows (see test_scanner_text_cache_atomic).
 on:
+  push:
+    branches: ["codex/pr7082-validation-dev"]
   workflow_dispatch:
   schedule:
     - cron: '17 6 * * 1'
